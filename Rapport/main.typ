@@ -50,6 +50,7 @@
 // #pagebreak()
 
 #include "sections/introduction.typ"
+#include "sections/discussion.typ"
 #include "sections/conclusion.typ"
 
 #pagebreak()
