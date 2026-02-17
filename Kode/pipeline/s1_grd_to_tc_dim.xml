@@ -1,0 +1,69 @@
+<graph id="S1_GRD_to_TC_DIM">
+  <version>1.0</version>
+
+  <node id="Read">
+    <operator>Read</operator>
+    <parameters>
+      <file>${in}</file>
+    </parameters>
+  </node>
+
+  <node id="Apply-Orbit-File">
+    <operator>Apply-Orbit-File</operator>
+    <sources>
+      <sourceProduct refid="Read"/>
+    </sources>
+    <parameters>
+      <orbitType>Sentinel Precise (Auto Download)</orbitType>
+      <continueOnFail>true</continueOnFail>
+    </parameters>
+  </node>
+
+  <node id="Calibration">
+    <operator>Calibration</operator>
+    <sources>
+      <sourceProduct refid="Apply-Orbit-File"/>
+    </sources>
+    <parameters>
+      <outputSigmaBand>true</outputSigmaBand>
+      <selectedPolarisations>VV,VH</selectedPolarisations>
+    </parameters>
+  </node>
+
+  <node id="Speckle-Filter">
+    <operator>Speckle-Filter</operator>
+    <sources>
+      <sourceProduct refid="Calibration"/>
+    </sources>
+    <parameters>
+      <filter>Refined Lee</filter>
+      <filterSizeX>7</filterSizeX>
+      <filterSizeY>7</filterSizeY>
+    </parameters>
+  </node>
+
+  <node id="Terrain-Correction">
+    <operator>Terrain-Correction</operator>
+    <sources>
+      <sourceProduct refid="Speckle-Filter"/>
+    </sources>
+    <parameters>
+      <demName>COPERNICUS 30m Global DEM</demName>
+      <pixelSpacingInMeter>10.0</pixelSpacingInMeter>
+      <mapProjection>${mapProjection}</mapProjection>
+      <saveSelectedSourceBand>true</saveSelectedSourceBand>
+      <sourceBands>Sigma0_VV,Sigma0_VH</sourceBands>
+    </parameters>
+  </node>
+
+  <node id="Write">
+    <operator>Write</operator>
+    <sources>
+      <sourceProduct refid="Terrain-Correction"/>
+    </sources>
+    <parameters>
+      <file>${out}</file>
+      <formatName>BEAM-DIMAP</formatName>
+    </parameters>
+  </node>
+</graph>
