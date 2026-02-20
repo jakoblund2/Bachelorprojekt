@@ -5,9 +5,9 @@ Stitch-first Sentinel-1/Sentinel-2 training dataset pipeline.
 Workflow:
 1) Search/download S2 products from CDSE and group by same acquisition pass.
 2) Stitch all S2 tiles in each pass into one AOI-clipped mosaic grid.
-3) Find nearest-in-time S1 scene, process with SNAP terrain correction.
+3) Find best-overlap/nearest-time S1 scenes, process with SNAP terrain correction.
 4) Warp S1 to stitched S2 grid.
-5) Extract strict-valid patches and write one NPZ per stitched mosaic.
+5) Extract patches using `min_valid_frac` and write NPZ output (`per_patch` or `per_pass`).
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -33,6 +33,10 @@ from rasterio.enums import Resampling
 from rasterio.transform import from_origin
 from rasterio.warp import reproject
 from rasterio.windows import Window
+from shapely import wkt as shapely_wkt
+from shapely.geometry import box, shape
+from shapely.geometry.base import BaseGeometry
+from shapely.ops import transform as shapely_transform, unary_union
 
 
 # -----------------------------
@@ -53,14 +57,18 @@ GRAPH_TC = BASE_DIR / "s1_grd_to_tc_dim.xml"
 TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token"
 ODATA_ROOT = "https://catalogue.dataspace.copernicus.eu/odata/v1"
 
+# Include SCL=6 (water) so ocean/water tiles are rejected by validity filtering.
 SCL_INVALID = {3, 8, 9, 10, 11}
 
-# Keep current 11-band layout (B08 omitted by decision).
+# Keep current 11-band layout (B08 and B10 omitted).
 S2_BANDS_11 = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B8A", "B09", "B11", "B12"]
 
 S2_NAME_RE = re.compile(
     r"^(?P<prefix>S2[AB]_MSIL2A_(?P<sensing>\d{8}T\d{6})_(?P<baseline>N\d{4})_(?P<orbit>R\d{3}))_"
     r"(?P<tile>T\d{2}[A-Z]{3})_(?P<generation>\d{8}T\d{6})(?:_.+)?$"
+)
+S1_ACQ_KEY_RE = re.compile(
+    r"^(S1[AB]_IW_GRDH_1SDV_\d{8}T\d{6}_\d{8}T\d{6}_[0-9A-Z]{6}_[0-9A-Z]{6})(?:_.+)?$"
 )
 
 
@@ -76,9 +84,10 @@ class Job:
     max_s2: int = 500
     max_cloud: float = 20.0
     max_time_diff_hours: int = 36
+    max_s1_scenes: int = 10
     tile: int = 256
     stride: int = 256
-    ocean_std_thr: float = 1.2
+    min_valid_frac: float = 0.9
     output_mode: str = "per_patch"  # "per_patch" or "per_pass"
 
 
@@ -93,19 +102,19 @@ JOBS: List[Job] = [
     #     max_time_diff_hours=36,
     #     tile=256,
     #     stride=256,
-    #     ocean_std_thr=1.2,
     # ),
     Job(
         name="larger_test",
         bbox_lonlat=(8.8, 55.7, 9.5, 56.2),  # small AOI
         date_start="2025-06-12",
         date_end="2025-06-12",
-        max_s2=30,                 # only one S2 product
-        max_cloud=30.0,          # maximize chance of getting a product
-        max_time_diff_hours=48,   # easier S1 match
-        tile=128,                 # smaller patch for quick test
+        max_s2=999,
+        max_cloud=30.0,
+        max_time_diff_hours=36,
+        max_s1_scenes=999,
+        tile=128,
         stride=128,
-        ocean_std_thr=0.0,        # don't reject flat areas during smoke test
+        min_valid_frac=0.9,
         output_mode="per_patch",
     ),
 ]
@@ -265,10 +274,151 @@ def parse_dt(prod: Dict[str, Any]) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def pick_nearest_by_time(candidates: List[Dict[str, Any]], target_dt: datetime) -> Optional[Dict[str, Any]]:
-    if not candidates:
+def strip_safe_suffix(name: str) -> str:
+    cleaned = name.strip()
+    for suffix in (".SAFE.zip", ".SAFE", ".zip"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+    return cleaned
+
+
+def s1_acquisition_key(name: str) -> str:
+    cleaned = strip_safe_suffix(name)
+    m = S1_ACQ_KEY_RE.match(cleaned)
+    if m:
+        return m.group(1)
+    return cleaned
+
+
+def parse_product_geometry(prod: Dict[str, Any]) -> Optional[BaseGeometry]:
+    raw = (
+        prod.get("GeoFootprint")
+        or prod.get("Footprint")
+        or prod.get("footprint")
+        or prod.get("Geometry")
+        or prod.get("geometry")
+    )
+    if raw is None:
         return None
-    return min(candidates, key=lambda p: abs((parse_dt(p) - target_dt).total_seconds()))
+
+    try:
+        geom: BaseGeometry
+        if isinstance(raw, dict):
+            geom = shape(raw)
+        elif isinstance(raw, str):
+            txt = raw.strip()
+            if txt.startswith("geography'") and txt.endswith("'"):
+                txt = txt[len("geography'") : -1]
+            if txt.upper().startswith("SRID=") and ";" in txt:
+                txt = txt.split(";", 1)[1]
+            geom = shapely_wkt.loads(txt)
+        else:
+            return None
+
+        if not geom.is_valid:
+            geom = geom.buffer(0)
+        if geom.is_empty:
+            return None
+        return geom
+    except Exception:
+        return None
+
+
+def build_s2_pass_target_geometry(
+    pass_products: List[Dict[str, Any]],
+    bbox_lonlat: Tuple[float, float, float, float],
+) -> BaseGeometry:
+    aoi = box(*bbox_lonlat)
+    geoms: List[BaseGeometry] = []
+    for p in pass_products:
+        g = parse_product_geometry(p)
+        if g is None:
+            continue
+        gi = g.intersection(aoi)
+        if not gi.is_empty:
+            geoms.append(gi)
+
+    if not geoms:
+        return aoi
+    return unary_union(geoms)
+
+
+def overlap_ratio(product_geom: Optional[BaseGeometry], target_geom: BaseGeometry) -> float:
+    if product_geom is None or target_geom.is_empty:
+        return 0.0
+    denom = float(target_geom.area)
+    if denom <= 0.0:
+        return 0.0
+    inter = product_geom.intersection(target_geom)
+    if inter.is_empty:
+        return 0.0
+    return max(0.0, min(1.0, float(inter.area) / denom))
+
+
+def pick_s1_scenes_by_overlap_time(
+    candidates: List[Dict[str, Any]],
+    target_dt: datetime,
+    max_time_diff_hours: int,
+    max_scenes: int,
+    target_geom: BaseGeometry,
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    if not candidates or max_scenes <= 0:
+        return [], {"raw": len(candidates), "within_time": 0, "deduped": 0}
+
+    max_sec = max_time_diff_hours * 3600.0
+    within_time = 0
+    best_by_acq: Dict[str, Dict[str, Any]] = {}
+
+    for p in candidates:
+        dt = parse_dt(p)
+        diff_sec = abs((dt - target_dt).total_seconds())
+        if diff_sec > max_sec:
+            continue
+        within_time += 1
+
+        name = p.get("Name", "")
+        acq_key = s1_acquisition_key(name)
+        geom = parse_product_geometry(p)
+        overlap = overlap_ratio(geom, target_geom)
+        prefer_non_cog = 0 if "_COG" in name else 1
+
+        entry = {
+            "product": dict(p),
+            "acq_key": acq_key,
+            "diff_sec": float(diff_sec),
+            "overlap": float(overlap),
+            "prefer_non_cog": int(prefer_non_cog),
+        }
+        score = (entry["overlap"], -entry["diff_sec"], entry["prefer_non_cog"])
+
+        prev = best_by_acq.get(acq_key)
+        if prev is None:
+            best_by_acq[acq_key] = entry
+            continue
+        prev_score = (prev["overlap"], -prev["diff_sec"], prev["prefer_non_cog"])
+        if score > prev_score:
+            best_by_acq[acq_key] = entry
+
+    deduped = list(best_by_acq.values())
+    deduped.sort(
+        key=lambda e: (
+            -e["overlap"],
+            e["diff_sec"],
+            -e["prefer_non_cog"],
+            e["product"].get("Name", ""),
+        )
+    )
+
+    selected: List[Dict[str, Any]] = []
+    for e in deduped[:max_scenes]:
+        prod = e["product"]
+        prod["_s1_overlap_ratio"] = float(e["overlap"])
+        prod["_s1_time_gap_hours"] = float(e["diff_sec"] / 3600.0)
+        prod["_s1_acq_key"] = e["acq_key"]
+        selected.append(prod)
+
+    stats = {"raw": len(candidates), "within_time": within_time, "deduped": len(deduped)}
+    return selected, stats
 
 
 def download_product_zip(
@@ -442,6 +592,42 @@ def aligned_aoi_grid(
     }
 
 
+def aligned_geom_grid(
+    geom_lonlat: BaseGeometry,
+    target_crs: str,
+    resolution: float = 10.0,
+) -> Dict[str, Any]:
+    if geom_lonlat.is_empty:
+        raise ValueError("Cannot build grid from empty geometry")
+
+    transformer = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+    geom_proj = shapely_transform(transformer.transform, geom_lonlat)
+    if geom_proj.is_empty:
+        raise ValueError("Projected geometry is empty")
+
+    min_x, min_y, max_x, max_y = geom_proj.bounds
+
+    min_x = math.floor(min_x / resolution) * resolution
+    min_y = math.floor(min_y / resolution) * resolution
+    max_x = math.ceil(max_x / resolution) * resolution
+    max_y = math.ceil(max_y / resolution) * resolution
+
+    width = int(round((max_x - min_x) / resolution))
+    height = int(round((max_y - min_y) / resolution))
+    if width <= 0 or height <= 0:
+        raise ValueError(f"Invalid aligned grid size: width={width}, height={height}")
+
+    transform = from_origin(min_x, max_y, resolution, resolution)
+    return {
+        "transform": transform,
+        "width": width,
+        "height": height,
+        "bounds": (min_x, min_y, max_x, max_y),
+        "resolution": resolution,
+        "crs": target_crs,
+    }
+
+
 def unzip_safe(zip_path: Path, out_dir: Path) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -549,8 +735,15 @@ def build_s2_mosaics(
     s2_pass_key: str,
     s2_zips: List[Path],
     target_crs: str,
+    s2_target_geom: Optional[BaseGeometry] = None,
 ) -> Dict[str, Path]:
-    grid = aligned_aoi_grid(job.bbox_lonlat, target_crs, resolution=10.0)
+    if s2_target_geom is not None:
+        try:
+            grid = aligned_geom_grid(s2_target_geom, target_crs, resolution=10.0)
+        except Exception:
+            grid = aligned_aoi_grid(job.bbox_lonlat, target_crs, resolution=10.0)
+    else:
+        grid = aligned_aoi_grid(job.bbox_lonlat, target_crs, resolution=10.0)
     mosaic_id = f"{job.name}__{s2_pass_key}"
 
     all_band_sources: Dict[str, List[Path]] = {band: [] for band in (S2_BANDS_11 + ["SCL"])}
@@ -671,6 +864,61 @@ def warp_s1_to_grid_db(vv_path: Path, vh_path: Path, ref_grid_path: Path, out_pa
     return out_path
 
 
+def sanitize_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", name)
+
+
+def merge_warped_s1_scenes(warped_s1_paths: List[Path], out_path: Path) -> Path:
+    if not warped_s1_paths:
+        raise ValueError("No warped S1 scenes provided for merge")
+
+    if len(warped_s1_paths) == 1:
+        src = warped_s1_paths[0]
+        if src != out_path:
+            shutil.copyfile(src, out_path)
+        return out_path
+
+    handles = [rasterio.open(p) for p in warped_s1_paths]
+    try:
+        ref = handles[0]
+        profile = ref.profile.copy()
+        profile.update(
+            driver="GTiff",
+            count=2,
+            dtype="float32",
+            nodata=np.nan,
+            compress="deflate",
+            predictor=2,
+            tiled=True,
+            blockxsize=256,
+            blockysize=256,
+        )
+
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with rasterio.open(out_path, "w", **profile) as out:
+            for _, window in ref.block_windows(1):
+                h = int(window.height)
+                w = int(window.width)
+                acc = np.zeros((2, h, w), dtype=np.float64)
+                cnt = np.zeros((2, h, w), dtype=np.uint16)
+
+                for ds in handles:
+                    blk = ds.read([1, 2], window=window).astype(np.float32)
+                    ok = np.isfinite(blk)
+                    acc[ok] += blk[ok]
+                    cnt[ok] += 1
+
+                merged = np.full((2, h, w), np.nan, dtype=np.float32)
+                valid = cnt > 0
+                merged[valid] = (acc[valid] / cnt[valid]).astype(np.float32)
+                out.write(merged, window=window)
+    finally:
+        for ds in handles:
+            ds.close()
+
+    return out_path
+
+
 # -----------------------------
 # Patch extraction / NPZ writing
 # -----------------------------
@@ -680,53 +928,158 @@ def scan_valid_patch_indices(
     s1_path: Path,
     tile: int,
     stride: int,
-    ocean_std_thr: float,
+    min_valid_frac: float,
 ) -> Dict[str, Any]:
     accepted: List[Tuple[int, int]] = []
 
-    total = 0
+    total_windows = 0
+    total_scanned = 0
+    prefilter_nonzero = 0
     skipped_valid = 0
-    skipped_ocean = 0
+    fail_clear = 0
+    fail_nonzero = 0
+    fail_s1ok = 0
+    fail_combo = {
+        "clear_only": 0,
+        "nonzero_only": 0,
+        "s1_only": 0,
+        "clear_nonzero": 0,
+        "clear_s1": 0,
+        "nonzero_s1": 0,
+        "clear_nonzero_s1": 0,
+    }
 
     with rasterio.open(b02_path) as b02_ds, rasterio.open(scl_path) as scl_ds, rasterio.open(s1_path) as s1_ds:
         height, width = b02_ds.height, b02_ds.width
+        if height < tile or width < tile:
+            return {
+                "indices": accepted,
+                "total_windows": 0,
+                "total_scanned": 0,
+                "prefilter_nonzero": 0,
+                "skipped_valid": 0,
+                "fail_clear": 0,
+                "fail_nonzero": 0,
+                "fail_s1ok": 0,
+                "fail_combo": fail_combo,
+            }
 
-        for r0 in range(0, height - tile + 1, stride):
-            for c0 in range(0, width - tile + 1, stride):
-                total += 1
+        # Estimate valid-S2 footprint (B02 > 0) and scan only windows intersecting it.
+        row_min = height
+        row_max = -1
+        col_min = width
+        col_max = -1
+        for _, win in b02_ds.block_windows(1):
+            block = b02_ds.read(1, window=win)
+            nz = block > 0
+            if not np.any(nz):
+                continue
+            rr = np.where(np.any(nz, axis=1))[0]
+            cc = np.where(np.any(nz, axis=0))[0]
+            if rr.size == 0 or cc.size == 0:
+                continue
+            row_min = min(row_min, int(win.row_off) + int(rr[0]))
+            row_max = max(row_max, int(win.row_off) + int(rr[-1]))
+            col_min = min(col_min, int(win.col_off) + int(cc[0]))
+            col_max = max(col_max, int(win.col_off) + int(cc[-1]))
+
+        if row_max < 0 or col_max < 0:
+            return {
+                "indices": accepted,
+                "total_windows": 0,
+                "total_scanned": 0,
+                "prefilter_nonzero": 0,
+                "skipped_valid": 0,
+                "fail_clear": 0,
+                "fail_nonzero": 0,
+                "fail_s1ok": 0,
+                "fail_combo": fail_combo,
+            }
+
+        row_starts = [
+            r0
+            for r0 in range(0, height - tile + 1, stride)
+            if not (r0 + tile - 1 < row_min or r0 > row_max)
+        ]
+        col_starts = [
+            c0
+            for c0 in range(0, width - tile + 1, stride)
+            if not (c0 + tile - 1 < col_min or c0 > col_max)
+        ]
+        total_windows = len(row_starts) * len(col_starts)
+
+        for r0 in row_starts:
+            for c0 in col_starts:
                 win = Window(c0, r0, tile, tile)
 
                 b02 = b02_ds.read(1, window=win)
+                nonzero = b02 > 0
+                nonzero_frac = float(nonzero.mean())
+                if nonzero_frac < min_valid_frac:
+                    prefilter_nonzero += 1
+                    fail_nonzero += 1
+                    fail_combo["nonzero_only"] += 1
+                    continue
+
+                total_scanned += 1
                 scl = scl_ds.read(1, window=win).astype(np.uint8)
                 s1 = s1_ds.read([1, 2], window=win).astype(np.float32)
 
                 clear = ~np.isin(scl, list(SCL_INVALID))
-                nonzero = b02 > 0
                 s1_ok = np.isfinite(s1[0]) & np.isfinite(s1[1]) & (s1[0] > -80) & (s1[1] > -80)
+                clear_frac = float(clear.mean())
+                s1ok_frac = float(s1_ok.mean())
 
                 valid = clear & nonzero & s1_ok
-                if not bool(valid.all()):
+                valid_frac = float(valid.mean())
+                if valid_frac < min_valid_frac:
                     skipped_valid += 1
-                    continue
+                    clear_fail = clear_frac < min_valid_frac
+                    nonzero_fail = False
+                    s1ok_fail = s1ok_frac < min_valid_frac
+                    if clear_fail:
+                        fail_clear += 1
+                    if nonzero_fail:
+                        fail_nonzero += 1
+                    if s1ok_fail:
+                        fail_s1ok += 1
 
-                vv_std = float(np.nanstd(s1[0][valid]))
-                if vv_std < ocean_std_thr:
-                    skipped_ocean += 1
+                    flags = (clear_fail, nonzero_fail, s1ok_fail)
+                    if flags == (True, False, False):
+                        fail_combo["clear_only"] += 1
+                    elif flags == (False, True, False):
+                        fail_combo["nonzero_only"] += 1
+                    elif flags == (False, False, True):
+                        fail_combo["s1_only"] += 1
+                    elif flags == (True, True, False):
+                        fail_combo["clear_nonzero"] += 1
+                    elif flags == (True, False, True):
+                        fail_combo["clear_s1"] += 1
+                    elif flags == (False, True, True):
+                        fail_combo["nonzero_s1"] += 1
+                    elif flags == (True, True, True):
+                        fail_combo["clear_nonzero_s1"] += 1
                     continue
 
                 accepted.append((r0, c0))
 
     return {
         "indices": accepted,
-        "total": total,
+        "total_windows": total_windows,
+        "total_scanned": total_scanned,
+        "prefilter_nonzero": prefilter_nonzero,
         "skipped_valid": skipped_valid,
-        "skipped_ocean": skipped_ocean,
+        "fail_clear": fail_clear,
+        "fail_nonzero": fail_nonzero,
+        "fail_s1ok": fail_s1ok,
+        "fail_combo": fail_combo,
     }
 
 
 def write_npz_single_file(
     out_path: Path,
     s2_band_paths: Dict[str, Path],
+    scl_path: Path,
     s1_path: Path,
     indices: List[Tuple[int, int]],
     tile: int,
@@ -766,18 +1119,28 @@ def write_npz_single_file(
 
     s2_handles: Dict[str, rasterio.DatasetReader] = {}
     try:
-        with rasterio.open(s1_path) as s1_ds:
+        with rasterio.open(s1_path) as s1_ds, rasterio.open(scl_path) as scl_ds:
             for band in S2_BANDS_11:
                 s2_handles[band] = rasterio.open(s2_band_paths[band])
 
             for i, (r0, c0) in enumerate(indices):
                 win = Window(c0, r0, tile, tile)
 
-                s1_mm[i] = s1_ds.read([1, 2], window=win).astype(np.float32)
+                s1_patch = s1_ds.read([1, 2], window=win).astype(np.float32)
+                s1_mm[i] = s1_patch
                 for b_idx, band in enumerate(S2_BANDS_11):
                     s2_mm[i, b_idx] = s2_handles[band].read(1, window=win).astype(np.float32)
 
-                valid_mm[i].fill(1)
+                scl = scl_ds.read(1, window=win).astype(np.uint8)
+                clear = ~np.isin(scl, list(SCL_INVALID))
+                nonzero = s2_mm[i, S2_BANDS_11.index("B02")] > 0
+                s1_ok = (
+                    np.isfinite(s1_patch[0])
+                    & np.isfinite(s1_patch[1])
+                    & (s1_patch[0] > -80)
+                    & (s1_patch[1] > -80)
+                )
+                valid_mm[i] = (clear & nonzero & s1_ok).astype(np.uint8)
                 row_mm[i] = r0
                 col_mm[i] = c0
 
@@ -809,6 +1172,7 @@ def write_npz_per_patch(
     out_dir: Path,
     base_name: str,
     s2_band_paths: Dict[str, Path],
+    scl_path: Path,
     s1_path: Path,
     indices: List[Tuple[int, int]],
     tile: int,
@@ -822,7 +1186,7 @@ def write_npz_per_patch(
 
     s2_handles: Dict[str, rasterio.DatasetReader] = {}
     try:
-        with rasterio.open(s1_path) as s1_ds:
+        with rasterio.open(s1_path) as s1_ds, rasterio.open(scl_path) as scl_ds:
             for band in S2_BANDS_11:
                 s2_handles[band] = rasterio.open(s2_band_paths[band])
 
@@ -834,7 +1198,11 @@ def write_npz_per_patch(
                 for b_idx, band in enumerate(S2_BANDS_11):
                     s2[b_idx] = s2_handles[band].read(1, window=win).astype(np.float32)
 
-                valid = np.ones((tile, tile), dtype=np.uint8)
+                scl = scl_ds.read(1, window=win).astype(np.uint8)
+                clear = ~np.isin(scl, list(SCL_INVALID))
+                nonzero = s2[S2_BANDS_11.index("B02")] > 0
+                s1_ok = np.isfinite(s1[0]) & np.isfinite(s1[1]) & (s1[0] > -80) & (s1[1] > -80)
+                valid = (clear & nonzero & s1_ok).astype(np.uint8)
 
                 meta = dict(meta_base)
                 meta["row0"] = int(r0)
@@ -869,37 +1237,80 @@ def build_stitched_npz_for_pass(
     job: Job,
     s2_pass_key: str,
     s2_products: List[Dict[str, Any]],
-    s1_product: Dict[str, Any],
+    s1_products: List[Dict[str, Any]],
     token: str,
+    s2_target_geom: Optional[BaseGeometry] = None,
 ) -> str:
-    # Download all S2 tiles in pass + one S1 product.
+    # Download all S2 tiles in pass + selected S1 products.
     s2_zips: List[Path] = []
     for p in s2_products:
         zip_path, token = download_product_zip(cdse_token, token, p, DOWNLOAD_DIR)
         s2_zips.append(zip_path)
 
-    s1_zip, token = download_product_zip(cdse_token, token, s1_product, DOWNLOAD_DIR)
+    s1_zips: List[Path] = []
+    for p in s1_products:
+        s1_zip, token = download_product_zip(cdse_token, token, p, DOWNLOAD_DIR)
+        s1_zips.append(s1_zip)
 
     target_crs = utm_epsg_from_bbox(job.bbox_lonlat)
     log(f"  Target CRS: {target_crs}")
 
     # 1) Stitch S2 AOI mosaics.
-    s2_mosaic = build_s2_mosaics(job, s2_pass_key, s2_zips, target_crs)
+    s2_mosaic = build_s2_mosaics(
+        job,
+        s2_pass_key,
+        s2_zips,
+        target_crs,
+        s2_target_geom=s2_target_geom,
+    )
 
-    # 2) Process and align S1.
-    vv_img, vh_img = process_s1_to_tc_imgs(s1_zip, target_crs)
-    s1_on_s2 = MOSAIC_DIR / f"{job.name}__{s2_pass_key}__{s1_product['Name']}__S1_on_S2.tif"
-    warp_s1_to_grid_db(vv_img, vh_img, s2_mosaic["B02"], s1_on_s2)
+    # 2) Process and align each S1, then merge S1 coverage on S2 grid.
+    warped_s1_paths: List[Path] = []
+    for p, s1_zip in zip(s1_products, s1_zips):
+        vv_img, vh_img = process_s1_to_tc_imgs(s1_zip, target_crs)
+        scene_tag = sanitize_name(p["Name"])
+        warped = MOSAIC_DIR / f"{job.name}__{s2_pass_key}__{scene_tag}__S1_on_S2_src.tif"
+        warp_s1_to_grid_db(vv_img, vh_img, s2_mosaic["B02"], warped)
+        warped_s1_paths.append(warped)
 
-    # 3) Scan valid windows (strict 100%).
+    s1_merge_tag = f"S1multi{len(s1_products)}_{parse_dt(s1_products[0]).strftime('%Y%m%dT%H%M%S')}"
+    s1_on_s2 = MOSAIC_DIR / f"{job.name}__{s2_pass_key}__{s1_merge_tag}__S1_on_S2.tif"
+    merge_warped_s1_scenes(warped_s1_paths, s1_on_s2)
+
+    # 3) Scan valid windows using configured min_valid_frac.
     scan = scan_valid_patch_indices(
         b02_path=s2_mosaic["B02"],
         scl_path=s2_mosaic["SCL"],
         s1_path=s1_on_s2,
         tile=job.tile,
         stride=job.stride,
-        ocean_std_thr=job.ocean_std_thr,
+        min_valid_frac=job.min_valid_frac,
     )
+    log(f"  valid threshold: min_valid_frac={job.min_valid_frac:.2f}")
+    log(
+        "  S2 prefilter: "
+        f"candidate_windows={scan['total_windows']} "
+        f"scanned={scan['total_scanned']} "
+        f"prefilter_nonzero={scan['prefilter_nonzero']}"
+    )
+    if scan["skipped_valid"] > 0:
+        log(
+            "  skipped_valid breakdown: "
+            f"s1={scan['fail_s1ok']} "
+            f"nonzero={scan['fail_nonzero']} "
+            f"clear={scan['fail_clear']}"
+        )
+        combo = scan["fail_combo"]
+        log(
+            "  skipped_valid combos: "
+            f"s1_only={combo['s1_only']} "
+            f"nonzero_only={combo['nonzero_only']} "
+            f"clear_only={combo['clear_only']} "
+            f"nonzero_s1={combo['nonzero_s1']} "
+            f"clear_s1={combo['clear_s1']} "
+            f"clear_nonzero={combo['clear_nonzero']} "
+            f"all_three={combo['clear_nonzero_s1']}"
+        )
 
     indices = scan["indices"]
     with rasterio.open(s2_mosaic["B02"]) as b02_ds:
@@ -907,27 +1318,22 @@ def build_stitched_npz_for_pass(
         mosaic_bounds = tuple(float(x) for x in b02_ds.bounds)
         mosaic_crs = str(b02_ds.crs)
 
-    base_name = f"{job.name}__{s2_pass_key}__{s1_product['Name']}"
+    base_name = f"{job.name}__{s2_pass_key}__{s1_merge_tag}"
 
     meta = {
         "job": job.name,
         "s2_pass": s2_pass_key,
         "s2_tiles": [p["Name"] for p in s2_products],
-        "s1_scene": s1_product["Name"],
+        "s1_scenes": [p["Name"] for p in s1_products],
         "tile": int(job.tile),
         "stride": int(job.stride),
-        "strict_valid": True,
+        "min_valid_frac": float(job.min_valid_frac),
         "s2_bands": S2_BANDS_11,
         "scl_invalid": sorted(SCL_INVALID),
-        "ocean_std_thr": float(job.ocean_std_thr),
         "target_crs": mosaic_crs,
         "mosaic_shape_hw": [int(mosaic_shape[0]), int(mosaic_shape[1])],
         "mosaic_bounds": list(mosaic_bounds),
-        "window_total": int(scan["total"]),
-        "accepted": int(len(indices)),
-        "skipped_valid": int(scan["skipped_valid"]),
-        "skipped_ocean": int(scan["skipped_ocean"]),
-        "created_utc": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
 
     # 4) Write outputs in selected mode.
@@ -936,6 +1342,7 @@ def build_stitched_npz_for_pass(
         write_npz_single_file(
             out_path=out_path,
             s2_band_paths=s2_mosaic,
+            scl_path=s2_mosaic["SCL"],
             s1_path=s1_on_s2,
             indices=indices,
             tile=job.tile,
@@ -944,8 +1351,8 @@ def build_stitched_npz_for_pass(
         size_mb = out_path.stat().st_size / (1024 * 1024)
         log(
             f"  Wrote NPZ: {out_path.name} | "
-            f"patches={len(indices)} / windows={scan['total']} | "
-            f"skipped_valid={scan['skipped_valid']} skipped_ocean={scan['skipped_ocean']} | "
+            f"patches={len(indices)} / windows={scan['total_scanned']} | "
+            f"skipped_valid={scan['skipped_valid']} | "
             f"size={size_mb:.1f} MB"
         )
     else:
@@ -953,6 +1360,7 @@ def build_stitched_npz_for_pass(
             out_dir=OUT_DIR,
             base_name=base_name,
             s2_band_paths=s2_mosaic,
+            scl_path=s2_mosaic["SCL"],
             s1_path=s1_on_s2,
             indices=indices,
             tile=job.tile,
@@ -960,8 +1368,7 @@ def build_stitched_npz_for_pass(
         )
         log(
             f"  Wrote patch NPZ files: {wrote} | "
-            f"windows={scan['total']} skipped_valid={scan['skipped_valid']} "
-            f"skipped_ocean={scan['skipped_ocean']}"
+            f"windows={scan['total_scanned']} skipped_valid={scan['skipped_valid']}"
         )
 
     return token
@@ -999,35 +1406,45 @@ def run_batch() -> None:
 
         for s2_pass_key, pass_products in ordered_groups:
             s2_center = parse_dt(pass_products[0])
+            s2_target_geom = build_s2_pass_target_geometry(pass_products, job.bbox_lonlat)
             s1_cands, token = odata_search_s1(
                 token=token,
                 bbox_lonlat=job.bbox_lonlat,
                 dt_center_iso=pass_products[0]["ContentDate"]["Start"],
                 hours=job.max_time_diff_hours,
-                top=10,
+                top=max(40, job.max_s1_scenes * 12),
             )
 
-            s1_best = pick_nearest_by_time(s1_cands, s2_center)
-            if not s1_best:
-                log(f"Skip pass {s2_pass_key}: no S1 candidate")
+            s1_selected, s1_stats = pick_s1_scenes_by_overlap_time(
+                candidates=s1_cands,
+                target_dt=s2_center,
+                max_time_diff_hours=job.max_time_diff_hours,
+                max_scenes=job.max_s1_scenes,
+                target_geom=s2_target_geom,
+            )
+            if not s1_selected:
+                log(f"Skip pass {s2_pass_key}: no S1 candidate within {job.max_time_diff_hours}h")
                 continue
 
-            gap_h = abs((parse_dt(s1_best) - s2_center).total_seconds()) / 3600.0
-            if gap_h > job.max_time_diff_hours:
-                log(f"Skip pass {s2_pass_key}: nearest S1 gap={gap_h:.1f}h exceeds {job.max_time_diff_hours}h")
-                continue
+            gaps = [float(p.get("_s1_time_gap_hours", abs((parse_dt(p) - s2_center).total_seconds()) / 3600.0)) for p in s1_selected]
+            overlaps = [float(p.get("_s1_overlap_ratio", 0.0)) for p in s1_selected]
+            gap_min, gap_max = min(gaps), max(gaps)
+            ov_min, ov_max = min(overlaps), max(overlaps)
 
             log(
                 f"PASS {s2_pass_key} | S2 tiles={len(pass_products)} | "
-                f"S1={s1_best['Name']} | gap={gap_h:.1f}h"
+                f"S1 scenes={len(s1_selected)} | gap_range={gap_min:.1f}-{gap_max:.1f}h | "
+                f"ov_range={ov_min:.2f}-{ov_max:.2f} | "
+                f"S1 raw/within/dedup={s1_stats['raw']}/{s1_stats['within_time']}/{s1_stats['deduped']}"
             )
 
             token = build_stitched_npz_for_pass(
                 job=job,
                 s2_pass_key=s2_pass_key,
                 s2_products=pass_products,
-                s1_product=s1_best,
+                s1_products=s1_selected,
                 token=token,
+                s2_target_geom=s2_target_geom,
             )
 
 
