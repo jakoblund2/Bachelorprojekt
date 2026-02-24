@@ -10,8 +10,6 @@ Workflow:
 5) Extract patches using `min_valid_frac` and write NPZ output (`per_patch` or `per_pass`).
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import math
@@ -76,8 +74,8 @@ ODATA_TOP_MAX = 999
 DF_FALLBACK_BBOX_EPSG = 25832
 AERIAL_MAX_FILES_PER_CHUNK = 64
 
-# Include SCL=6 (water) so ocean/water tiles are rejected by validity filtering.
-SCL_INVALID = {3, 6, 8, 9, 10, 11}
+# 6 is water
+SCL_INVALID = {3, 8, 9, 10, 11}
 
 # Keep current 11-band layout (B08 and B10 omitted).
 S2_BANDS_11 = ["B01", "B02", "B03", "B04", "B05", "B06", "B07", "B8A", "B09", "B11", "B12"]
@@ -142,8 +140,10 @@ class Job:
     min_valid_frac: float = 0.9
     output_mode: str = "per_patch"  # "per_patch" or "per_pass"
     aerial_target_res_m: float = 1.0
+    aerial_min_cov_frac: float = 0.98
     aerial_download_batch_gb: float = 4.0
-    aerial_workers: int = 32
+    aerial_workers: int = 32  # concurrent aerial file download/downsample workers
+    aerial_chunk_workers: int = 24  # concurrent chunk-mosaic build workers
 
 
 JOBS: List[Job] = [
@@ -167,13 +167,15 @@ JOBS: List[Job] = [
         max_cloud=10.0,
         max_time_diff_hours=36,
         max_s1_scenes=10,
-        tile=256,
-        stride=256,
+        tile=128,
+        stride=128,
         min_valid_frac=0.9,
         output_mode="per_patch",
         aerial_target_res_m=1.0,
+        aerial_min_cov_frac=0.9,
         aerial_download_batch_gb=4.0,
         aerial_workers=32,
+        aerial_chunk_workers=24,
     ),
 ]
 
@@ -201,6 +203,21 @@ load_dotenv(BASE_DIR / ".env")
 # -----------------------------
 def log(msg: str) -> None:
     print(msg, flush=True)
+
+
+def is_progress_tick(done: int, total: int, every: int) -> bool:
+    if total <= 0:
+        return False
+    if done >= total:
+        return True
+    return every > 0 and (done % every == 0)
+
+
+def with_bigtiff(profile: Dict[str, Any], mode: str = "IF_SAFER") -> Dict[str, Any]:
+    out = dict(profile)
+    # Avoid classic TIFF 4 GiB limits on large mosaics.
+    out["BIGTIFF"] = mode
+    return out
 
 
 def run(cmd: Iterable[str]) -> None:
@@ -653,7 +670,7 @@ def download_s1_s2_parallel(
             else:
                 s1_zips[idx] = path
             done += 1
-            if done % 5 == 0 or done == len(futures):
+            if is_progress_tick(done, len(futures), 5):
                 log(f"  CDSE download progress: {done}/{len(futures)}")
 
     if any(p is None for p in s2_zips):
@@ -1072,7 +1089,7 @@ def build_aerial_catalog(
         for page in range(2, total_pages + 1):
             items, _m = fetch_df_available_page(session, api_key, dataset, page)
             _ingest(items)
-            if (page % progress_every == 0) or (page == total_pages):
+            if is_progress_tick(page, total_pages, progress_every):
                 log(f"  {dataset}: indexed {page}/{total_pages} pages ({(page / total_pages) * 100:.0f}%)")
 
         log(f"  {dataset}: total={total} indexed={kept}")
@@ -1492,13 +1509,14 @@ def create_aerial_rasters(aerial_path: Path, cov_path: Path, grid: Dict[str, Any
         "blockysize": 256,
     }
     aerial_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(aerial_path, "w", **profile):
+    # Aerial mosaics can exceed 4 GiB after chunk merges; force BigTIFF.
+    with rasterio.open(aerial_path, "w", **with_bigtiff(profile, mode="YES")):
         pass
 
     cov_profile = dict(profile)
     cov_profile.pop("predictor", None)
     cov_profile.update(count=1, dtype="uint8", nodata=0)
-    with rasterio.open(cov_path, "w", **cov_profile):
+    with rasterio.open(cov_path, "w", **with_bigtiff(cov_profile, mode="YES")):
         pass
 
 
@@ -1791,6 +1809,14 @@ def _chunk_grid_from_cache_paths(cache_paths: Sequence[Path], final_grid: Dict[s
     }
 
 
+def _scope_chunk_paths(scope_id: str, chunk_index: int) -> Tuple[Path, Path]:
+    chunk_dir = AERIAL_MOSAIC_DIR / f"{scope_id}__chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_aerial = chunk_dir / f"{scope_id}__chunk_{chunk_index:04d}__aerial.tif"
+    chunk_cov = chunk_dir / f"{scope_id}__chunk_{chunk_index:04d}__cov.tif"
+    return chunk_aerial, chunk_cov
+
+
 def _build_chunk_mosaic_for_records(
     chunk_index: int,
     chunk_records: Sequence[CatalogRecord],
@@ -1800,8 +1826,7 @@ def _build_chunk_mosaic_for_records(
     scope_id: str,
 ) -> Dict[str, Any]:
     t_chunk_build_start = perf_counter()
-    chunk_aerial = AERIAL_TMP_DIR / f"{scope_id}__chunk_{chunk_index:04d}__aerial.tif"
-    chunk_cov = AERIAL_TMP_DIR / f"{scope_id}__chunk_{chunk_index:04d}__cov.tif"
+    chunk_aerial, chunk_cov = _scope_chunk_paths(scope_id, chunk_index)
     chunk_aerial.unlink(missing_ok=True)
     chunk_cov.unlink(missing_ok=True)
 
@@ -1830,6 +1855,8 @@ def _build_chunk_mosaic_for_records(
             "missing_sources": int(missing_sources),
             "row_off": 0,
             "col_off": 0,
+            "width": 0,
+            "height": 0,
             "has_data": False,
             "build_seconds": perf_counter() - t_chunk_build_start,
         }
@@ -1856,72 +1883,39 @@ def _build_chunk_mosaic_for_records(
         "missing_sources": int(missing_sources),
         "row_off": int(chunk_grid["row_off"]),
         "col_off": int(chunk_grid["col_off"]),
+        "width": int(chunk_grid["width"]),
+        "height": int(chunk_grid["height"]),
         "has_data": True,
         "build_seconds": perf_counter() - t_chunk_build_start,
     }
 
 
-def _merge_chunk_mosaic_into_final(
-    chunk_aerial_path: Path,
-    chunk_cov_path: Path,
-    row_off: int,
-    col_off: int,
-    final_aerial_ds: rasterio.DatasetReader,
-    final_cov_ds: rasterio.DatasetReader,
-) -> None:
-    with rasterio.open(chunk_aerial_path) as chunk_aerial, rasterio.open(chunk_cov_path) as chunk_cov:
-        for _, win in chunk_cov.block_windows(1):
-            src_cov = chunk_cov.read(1, window=win)
-            mask = src_cov > 0
-            if not np.any(mask):
-                continue
-
-            dst_win = Window(
-                int(col_off + win.col_off),
-                int(row_off + win.row_off),
-                int(win.width),
-                int(win.height),
-            )
-            dst_cov = final_cov_ds.read(1, window=dst_win)
-            dst_cov[mask] = 1
-            final_cov_ds.write(dst_cov, 1, window=dst_win)
-
-            src_pix = chunk_aerial.read([1, 2, 3, 4], window=win)
-            dst_pix = final_aerial_ds.read([1, 2, 3, 4], window=dst_win)
-            dst_pix[:, mask] = src_pix[:, mask]
-            final_aerial_ds.write(dst_pix, window=dst_win)
-
-
-def _ingest_cached_aerial_to_mosaic(
+def _build_scope_chunk_mosaics(
     job: Job,
     selected: Sequence[CatalogRecord],
     target_res_m: float,
     record_cache_paths: Dict[Tuple[str, str], List[Path]],
-    aerial_path: Path,
-    cov_path: Path,
     grid: Dict[str, Any],
     scope_id: str,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[Dict[str, Any]], List[str], int, float, float]:
     t_ingest_total_start = perf_counter()
-    source_files_used: List[str] = []
-    missing_sources = 0
-
     total = len(selected)
     if not total:
-        return source_files_used, missing_sources
+        return [], [], 0, 0.0, 0.0
 
     chunk_target_gb = max(0.0, float(job.aerial_download_batch_gb))
     chunk_target_bytes = int(chunk_target_gb * 1024**3)
     chunks = _split_records_batches(selected, chunk_target_bytes)
+    chunk_workers = max(1, int(job.aerial_chunk_workers))
     log(
         f"    Build chunk mosaics in parallel: chunks={len(chunks)} "
-        f"workers={max(1, int(job.aerial_workers))}"
+        f"workers={chunk_workers}"
     )
 
     chunk_results: List[Dict[str, Any]] = []
     t_chunk_build_start = perf_counter()
     futures = {}
-    with ThreadPoolExecutor(max_workers=max(1, min(int(job.aerial_workers), len(chunks)))) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, min(chunk_workers, len(chunks)))) as pool:
         for i, chunk in enumerate(chunks, start=1):
             fut = pool.submit(
                 _build_chunk_mosaic_for_records,
@@ -1956,38 +1950,16 @@ def _ingest_cached_aerial_to_mosaic(
     )
 
     chunk_results.sort(key=lambda x: int(x["chunk_index"]))
-    log(f"    Merge chunk mosaics: {len(chunk_results)} -> shared mosaic")
-    t_merge_start = perf_counter()
-    with rasterio.open(aerial_path, "r+") as final_aerial_ds, rasterio.open(cov_path, "r+") as final_cov_ds:
-        for i, res in enumerate(chunk_results, start=1):
-            missing_sources += int(res.get("missing_sources", 0))
-            if res.get("has_data"):
-                _merge_chunk_mosaic_into_final(
-                    chunk_aerial_path=res["aerial_path"],
-                    chunk_cov_path=res["cov_path"],
-                    row_off=int(res.get("row_off", 0)),
-                    col_off=int(res.get("col_off", 0)),
-                    final_aerial_ds=final_aerial_ds,
-                    final_cov_ds=final_cov_ds,
-                )
-                source_files_used.extend(list(res.get("source_files_used", [])))
-            chunk_aerial_path = res.get("aerial_path")
-            chunk_cov_path = res.get("cov_path")
-            if isinstance(chunk_aerial_path, Path):
-                chunk_aerial_path.unlink(missing_ok=True)
-            if isinstance(chunk_cov_path, Path):
-                chunk_cov_path.unlink(missing_ok=True)
-            if (i % 4 == 0) or (i == len(chunk_results)):
-                log(f"    Merge progress: {i}/{len(chunk_results)}")
-    merge_seconds = perf_counter() - t_merge_start
-    ingest_total_seconds = perf_counter() - t_ingest_total_start
-    log(
-        "    Aerial ingest timing: "
-        f"build={chunk_build_seconds:.1f}s merge={merge_seconds:.1f}s "
-        f"total={ingest_total_seconds:.1f}s"
-    )
+    source_files_used: List[str] = []
+    missing_sources = 0
+    for res in chunk_results:
+        missing_sources += int(res.get("missing_sources", 0))
+        source_files_used.extend(list(res.get("source_files_used", [])))
 
-    return sorted(set(source_files_used)), int(missing_sources)
+    ingest_total_seconds = perf_counter() - t_ingest_total_start
+    log(f"    Aerial ingest timing: build={chunk_build_seconds:.1f}s total={ingest_total_seconds:.1f}s")
+
+    return chunk_results, sorted(set(source_files_used)), int(missing_sources), chunk_build_seconds, ingest_total_seconds
 
 
 def build_or_reuse_aerial_mosaic_for_scope(
@@ -1997,11 +1969,9 @@ def build_or_reuse_aerial_mosaic_for_scope(
     year: Optional[int],
     df_session: requests.Session,
     df_api_key: str,
-) -> Tuple[Path, Path, Dict[str, Any]]:
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[str, Any]]:
     t_scope_start = perf_counter()
     scope_id = _aerial_scope_key(job, year, target_crs)
-    aerial_path = AERIAL_MOSAIC_DIR / f"{scope_id}__aerial_1m.tif"
-    cov_path = AERIAL_MOSAIC_DIR / f"{scope_id}__aerial_cov_1m.tif"
     sidecar = AERIAL_MOSAIC_DIR / f"{scope_id}__aerial_sources.json"
     selected_datasets = sorted({r.dataset for r in selected})
     dataset_label = "+".join(selected_datasets) if selected_datasets else "unknown"
@@ -2009,41 +1979,60 @@ def build_or_reuse_aerial_mosaic_for_scope(
 
     grid = create_aligned_aerial_grid_from_job(job, target_crs)
 
-    if (
-        not AERIAL_REBUILD_MOSAIC
-        and aerial_path.exists()
-        and cov_path.exists()
-        and aerial_path.stat().st_size > 0
-        and cov_path.stat().st_size > 0
-    ):
-        info = {}
-        if sidecar.exists():
-            try:
-                info = json.loads(sidecar.read_text(encoding="utf-8"))
-            except Exception:
-                info = {}
-        existing_sources = set(info.get("source_files", []))
-        if required_sources and not required_sources.issubset(existing_sources):
-            missing_count = len(required_sources - existing_sources)
-            log(
-                f"  Rebuild aerial shared mosaic: {missing_count} selected source file(s) "
-                "not present in cached scope"
+    def _sidecar_chunks_to_paths(raw_chunks: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for ch in raw_chunks:
+            out.append(
+                {
+                    "chunk_index": int(ch.get("chunk_index", 0)),
+                    "aerial_path": Path(str(ch.get("aerial_path", ""))),
+                    "cov_path": Path(str(ch.get("cov_path", ""))),
+                    "source_files_used": list(ch.get("source_files_used", [])),
+                    "missing_sources": int(ch.get("missing_sources", 0)),
+                    "row_off": int(ch.get("row_off", 0)),
+                    "col_off": int(ch.get("col_off", 0)),
+                    "width": int(ch.get("width", 0)),
+                    "height": int(ch.get("height", 0)),
+                    "has_data": bool(ch.get("has_data", False)),
+                    "build_seconds": float(ch.get("build_seconds", 0.0)),
+                }
             )
+        return out
+
+    if not AERIAL_REBUILD_MOSAIC and sidecar.exists():
+        info = {}
+        try:
+            info = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            info = {}
+        existing_sources = set(info.get("source_files", []))
+        chunk_results = _sidecar_chunks_to_paths(info.get("chunks", []))
+        chunks_ready = bool(chunk_results) and all(
+            (not ch.get("has_data"))
+            or (file_is_ready(ch["aerial_path"]) and file_is_ready(ch["cov_path"]))
+            for ch in chunk_results
+        )
+        if not chunks_ready:
+            log("  Rebuild aerial shared chunks: cached chunk files missing or incomplete")
         else:
+            missing_count = len(required_sources - existing_sources) if required_sources else 0
             info.setdefault("scope_id", scope_id)
             info.setdefault("dataset", dataset_label)
             info.setdefault("datasets", selected_datasets)
             info.setdefault("year", year)
             info.setdefault("source_files", [f"{r.dataset}/{r.file_name}" for r in selected])
             info["reused"] = True
-            log(f"  Reuse aerial shared mosaic: {aerial_path.name}")
+            if missing_count > 0:
+                log(
+                    f"  Reuse aerial shared chunks (partial): {scope_id} "
+                    f"(missing_selected_sources={missing_count})"
+                )
+            else:
+                log(f"  Reuse aerial shared chunks: {scope_id}")
             log(f"  Aerial scope timing: {perf_counter() - t_scope_start:.1f}s (reused)")
-            return aerial_path, cov_path, info
+            return grid, chunk_results, info
 
-    log(f"  Build aerial shared mosaic: {aerial_path.name}")
-    t_create_start = perf_counter()
-    create_aerial_rasters(aerial_path, cov_path, grid)
-    create_seconds = perf_counter() - t_create_start
+    log(f"  Build aerial shared chunks: {scope_id}")
     cache_stats = _prepare_aerial_cache_for_selected(
         job=job,
         scope_id=scope_id,
@@ -2051,29 +2040,45 @@ def build_or_reuse_aerial_mosaic_for_scope(
         df_session=df_session,
         df_api_key=df_api_key,
     )
-    source_files_used, missing_sources = _ingest_cached_aerial_to_mosaic(
+    chunk_results, source_files_used, missing_sources, chunk_build_seconds, ingest_total_seconds = _build_scope_chunk_mosaics(
         job=job,
         selected=selected,
         target_res_m=job.aerial_target_res_m,
         record_cache_paths=cache_stats["record_cache_paths"],
-        aerial_path=aerial_path,
-        cov_path=cov_path,
         grid=grid,
         scope_id=scope_id,
     )
     total_scope_seconds = perf_counter() - t_scope_start
     log(
         "  Aerial scope timing: "
-        f"create={create_seconds:.1f}s "
         f"cache={float(cache_stats.get('cache_stage_seconds', 0.0)):.1f}s "
+        f"build={chunk_build_seconds:.1f}s "
         f"total={total_scope_seconds:.1f}s"
     )
+
+    chunks_sidecar = [
+        {
+            "chunk_index": int(ch.get("chunk_index", 0)),
+            "aerial_path": str(ch.get("aerial_path", "")),
+            "cov_path": str(ch.get("cov_path", "")),
+            "source_files_used": list(ch.get("source_files_used", [])),
+            "missing_sources": int(ch.get("missing_sources", 0)),
+            "row_off": int(ch.get("row_off", 0)),
+            "col_off": int(ch.get("col_off", 0)),
+            "width": int(ch.get("width", 0)),
+            "height": int(ch.get("height", 0)),
+            "has_data": bool(ch.get("has_data", False)),
+            "build_seconds": float(ch.get("build_seconds", 0.0)),
+        }
+        for ch in chunk_results
+    ]
 
     info = {
         "scope_id": scope_id,
         "dataset": dataset_label,
         "datasets": selected_datasets,
         "year": year,
+        "chunks": chunks_sidecar,
         "source_files": source_files_used,
         "missing_sources": int(missing_sources),
         "downloaded_gib": float(cache_stats["downloaded_bytes"]) / (1024**3),
@@ -2083,22 +2088,32 @@ def build_or_reuse_aerial_mosaic_for_scope(
         "cache_hits": int(cache_stats["cache_hits"]),
         "cache_misses": int(cache_stats["cache_misses"]),
         "cache_stage_seconds": float(cache_stats.get("cache_stage_seconds", 0.0)),
+        "ingest_stage_seconds": float(ingest_total_seconds),
         "scope_total_seconds": float(total_scope_seconds),
         "reused": False,
     }
     sidecar.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
-    return aerial_path, cov_path, info
+    return grid, chunk_results, info
 
 
 def enrich_npz_with_aerial_inplace(
     npz_path: Path,
-    aerial_ds: rasterio.DatasetReader,
-    cov_ds: rasterio.DatasetReader,
+    chunk_sources: Sequence[Dict[str, Any]],
     s2_ref_ds: rasterio.DatasetReader,
+    aerial_grid: Dict[str, Any],
     target_res_m: float,
+    min_cov_frac: float,
     meta_updates: Dict[str, Any],
     missing_policy: str,
 ) -> Tuple[bool, str]:
+    if not chunk_sources:
+        return False, "no_chunk_sources"
+
+    aerial_transform = aerial_grid["transform"]
+    aerial_crs = aerial_grid["crs"]
+    aerial_width = int(aerial_grid["width"])
+    aerial_height = int(aerial_grid["height"])
+
     with np.load(npz_path, allow_pickle=True) as d:
         if "s1" not in d or "s2" not in d or "valid" not in d:
             return False, "missing_keys"
@@ -2114,8 +2129,8 @@ def enrich_npz_with_aerial_inplace(
 
         s2_res_x = abs(float(s2_ref_ds.transform.a))
         s2_res_y = abs(float(s2_ref_ds.transform.e))
-        a_res_x = abs(float(aerial_ds.transform.a))
-        a_res_y = abs(float(aerial_ds.transform.e))
+        a_res_x = abs(float(aerial_transform.a))
+        a_res_y = abs(float(aerial_transform.e))
         sx = s2_res_x / a_res_x if a_res_x > 0 else 0.0
         sy = s2_res_y / a_res_y if a_res_y > 0 else 0.0
         if not (abs(sx - round(sx)) < 1e-6 and abs(sy - round(sy)) < 1e-6):
@@ -2127,22 +2142,67 @@ def enrich_npz_with_aerial_inplace(
             return False, "invalid_scale"
 
         x0, y0 = s2_ref_ds.transform * (col0, row0)
-        if s2_ref_ds.crs == aerial_ds.crs:
-            c1f, r1f = (~aerial_ds.transform) * (x0, y0)
+        if str(s2_ref_ds.crs) == str(aerial_crs):
+            c1f, r1f = (~aerial_transform) * (x0, y0)
         else:
-            tr = Transformer.from_crs(s2_ref_ds.crs, aerial_ds.crs, always_xy=True)
+            tr = Transformer.from_crs(s2_ref_ds.crs, aerial_crs, always_xy=True)
             x0a, y0a = tr.transform(x0, y0)
-            c1f, r1f = (~aerial_ds.transform) * (x0a, y0a)
+            c1f, r1f = (~aerial_transform) * (x0a, y0a)
         c1 = int(round(c1f))
         r1 = int(round(r1f))
         size1 = tile * scale
-        if r1 < 0 or c1 < 0 or (r1 + size1) > aerial_ds.height or (c1 + size1) > aerial_ds.width:
+        if r1 < 0 or c1 < 0 or (r1 + size1) > aerial_height or (c1 + size1) > aerial_width:
             return False, "out_of_bounds"
 
-        win = Window(c1, r1, size1, size1)
-        aerial = aerial_ds.read([1, 2, 3, 4], window=win).astype(np.uint8)
-        cov = cov_ds.read(1, window=win).astype(np.uint8)
-        if missing_policy == "drop" and not np.all(cov == 1):
+        aerial = np.zeros((4, size1, size1), dtype=np.uint8)
+        cov = np.zeros((size1, size1), dtype=np.uint8)
+        patch_r0, patch_c0 = r1, c1
+        patch_r1, patch_c1 = r1 + size1, c1 + size1
+
+        for chunk in chunk_sources:
+            row_off = int(chunk["row_off"])
+            col_off = int(chunk["col_off"])
+            h = int(chunk["height"])
+            w = int(chunk["width"])
+            if h <= 0 or w <= 0:
+                continue
+
+            chunk_r0, chunk_c0 = row_off, col_off
+            chunk_r1, chunk_c1 = row_off + h, col_off + w
+            ov_r0 = max(patch_r0, chunk_r0)
+            ov_c0 = max(patch_c0, chunk_c0)
+            ov_r1 = min(patch_r1, chunk_r1)
+            ov_c1 = min(patch_c1, chunk_c1)
+            if ov_r0 >= ov_r1 or ov_c0 >= ov_c1:
+                continue
+
+            src_win = Window(
+                int(ov_c0 - chunk_c0),
+                int(ov_r0 - chunk_r0),
+                int(ov_c1 - ov_c0),
+                int(ov_r1 - ov_r0),
+            )
+            src_cov = chunk["cov_ds"].read(1, window=src_win).astype(np.uint8)
+            mask = src_cov == 1
+            if not np.any(mask):
+                continue
+            src_aerial = chunk["aerial_ds"].read([1, 2, 3, 4], window=src_win).astype(np.uint8)
+
+            dst_r0 = int(ov_r0 - patch_r0)
+            dst_c0 = int(ov_c0 - patch_c0)
+            dst_r1 = dst_r0 + int(ov_r1 - ov_r0)
+            dst_c1 = dst_c0 + int(ov_c1 - ov_c0)
+
+            cov_block = cov[dst_r0:dst_r1, dst_c0:dst_c1]
+            cov_block[mask] = 1
+            cov[dst_r0:dst_r1, dst_c0:dst_c1] = cov_block
+            for bi in range(4):
+                dst_block = aerial[bi, dst_r0:dst_r1, dst_c0:dst_c1]
+                dst_block[mask] = src_aerial[bi][mask]
+                aerial[bi, dst_r0:dst_r1, dst_c0:dst_c1] = dst_block
+
+        cov_frac = float((cov == 1).mean())
+        if missing_policy == "drop" and cov_frac < float(min_cov_frac):
             return False, "missing_aerial"
 
         meta = {}
@@ -2156,9 +2216,10 @@ def enrich_npz_with_aerial_inplace(
                 "aerial_bands": ["R", "G", "B", "NIR"],
                 "aerial_res_m": float(target_res_m),
                 "aerial_scale": int(scale),
-                "aerial_mosaic_crs": str(aerial_ds.crs),
-                "aerial_mosaic_transform": [float(x) for x in aerial_ds.transform[:6]],
+                "aerial_mosaic_crs": str(aerial_crs),
+                "aerial_mosaic_transform": [float(x) for x in aerial_transform[:6]],
                 "aerial_tile_hw": [int(size1), int(size1)],
+                "aerial_cov_frac": float(cov_frac),
             }
         )
 
@@ -2219,7 +2280,7 @@ def enrich_pass_patch_files_with_aerial(
     mix_str = ", ".join(f"{k}:{v}" for k, v in counts_by_dataset.items())
     log(f"  Aerial dataset mix: {mix_str}")
 
-    aerial_path, cov_path, info = build_or_reuse_aerial_mosaic_for_scope(
+    aerial_grid, chunk_results, info = build_or_reuse_aerial_mosaic_for_scope(
         job=job,
         target_crs=target_crs,
         selected=selected,
@@ -2227,6 +2288,13 @@ def enrich_pass_patch_files_with_aerial(
         df_session=df_session,
         df_api_key=df_api_key,
     )
+    if not chunk_results:
+        log(f"  Aerial: no usable chunk mosaics for pass {s2_pass_key}; dropping {len(patch_paths)} patch files")
+        for p in patch_paths:
+            p.unlink(missing_ok=True)
+        return 0, len(patch_paths)
+
+    min_cov_frac = max(0.0, min(1.0, float(job.aerial_min_cov_frac)))
 
     kept = 0
     dropped = 0
@@ -2239,30 +2307,67 @@ def enrich_pass_patch_files_with_aerial(
         "aerial_source_files": list(info.get("source_files", [f"{r.dataset}/{r.file_name}" for r in selected])),
         "aerial_date_policy": AERIAL_DATE_POLICY,
         "aerial_missing_policy": AERIAL_MISSING_POLICY,
+        "aerial_min_cov_frac": float(min_cov_frac),
     }
+    log(f"  Aerial coverage threshold: min_cov_frac={min_cov_frac:.2f}")
 
-    with rasterio.open(s2_b02_path) as s2_ref_ds, rasterio.open(aerial_path) as aerial_ds, rasterio.open(
-        cov_path
-    ) as cov_ds:
-        for npz_path in patch_paths:
-            ok, reason = enrich_npz_with_aerial_inplace(
-                npz_path=npz_path,
-                aerial_ds=aerial_ds,
-                cov_ds=cov_ds,
-                s2_ref_ds=s2_ref_ds,
-                target_res_m=job.aerial_target_res_m,
-                meta_updates=meta_updates,
-                missing_policy=AERIAL_MISSING_POLICY,
+    chunk_sources: List[Dict[str, Any]] = []
+    try:
+        for ch in sorted(chunk_results, key=lambda x: int(x.get("chunk_index", 0))):
+            if not bool(ch.get("has_data", False)):
+                continue
+            ap = Path(ch["aerial_path"])
+            cp = Path(ch["cov_path"])
+            if not (file_is_ready(ap) and file_is_ready(cp)):
+                continue
+            chunk_sources.append(
+                {
+                    "row_off": int(ch.get("row_off", 0)),
+                    "col_off": int(ch.get("col_off", 0)),
+                    "width": int(ch.get("width", 0)),
+                    "height": int(ch.get("height", 0)),
+                    "aerial_ds": rasterio.open(ap),
+                    "cov_ds": rasterio.open(cp),
+                }
             )
-            if ok:
-                if final_out_dir is not None and npz_path.parent != final_out_dir:
-                    final_out_dir.mkdir(parents=True, exist_ok=True)
-                    final_path = final_out_dir / npz_path.name
-                    npz_path.replace(final_path)
-                kept += 1
-            else:
-                dropped += 1
-                npz_path.unlink(missing_ok=True)
+
+        if not chunk_sources:
+            log(f"  Aerial: chunk files missing for pass {s2_pass_key}; dropping {len(patch_paths)} patch files")
+            for p in patch_paths:
+                p.unlink(missing_ok=True)
+            return 0, len(patch_paths)
+
+        with rasterio.open(s2_b02_path) as s2_ref_ds:
+            for npz_path in patch_paths:
+                ok, _ = enrich_npz_with_aerial_inplace(
+                    npz_path=npz_path,
+                    chunk_sources=chunk_sources,
+                    s2_ref_ds=s2_ref_ds,
+                    aerial_grid=aerial_grid,
+                    target_res_m=job.aerial_target_res_m,
+                    min_cov_frac=min_cov_frac,
+                    meta_updates=meta_updates,
+                    missing_policy=AERIAL_MISSING_POLICY,
+                )
+                if ok:
+                    if final_out_dir is not None and npz_path.parent != final_out_dir:
+                        final_out_dir.mkdir(parents=True, exist_ok=True)
+                        final_path = final_out_dir / npz_path.name
+                        npz_path.replace(final_path)
+                    kept += 1
+                else:
+                    dropped += 1
+                    npz_path.unlink(missing_ok=True)
+    finally:
+        for ch in chunk_sources:
+            try:
+                ch["aerial_ds"].close()
+            except Exception:
+                pass
+            try:
+                ch["cov_ds"].close()
+            except Exception:
+                pass
 
     return kept, dropped
 
@@ -2439,7 +2544,7 @@ def create_single_band_raster(
         profile["predictor"] = 2
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with rasterio.open(out_path, "w", **profile):
+    with rasterio.open(out_path, "w", **with_bigtiff(profile)):
         pass
 
 
@@ -2663,7 +2768,7 @@ def merge_warped_s1_scenes(warped_s1_paths: List[Path], out_path: Path) -> Path:
         )
 
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        with rasterio.open(out_path, "w", **profile) as out:
+        with rasterio.open(out_path, "w", **with_bigtiff(profile)) as out:
             for _, window in ref.block_windows(1):
                 h = int(window.height)
                 w = int(window.width)
@@ -3029,7 +3134,7 @@ def write_npz_per_patch(
                 )
                 wrote_paths.append(out)
 
-                if (j + 1) % 500 == 0 or (j + 1) == len(to_write):
+                if is_progress_tick(j + 1, len(to_write), 500):
                     log(f"    Wrote patch files: {j + 1}/{len(to_write)}")
     finally:
         for ds in s2_handles.values():
@@ -3109,7 +3214,7 @@ def build_stitched_npz_for_pass(
                 idx = futures[fut]
                 warped_slots[idx] = fut.result()
                 done += 1
-                if done % 2 == 0 or done == len(futures):
+                if is_progress_tick(done, len(futures), 2):
                     log(f"  S1 processing progress: {done}/{len(futures)}")
 
     if any(p is None for p in warped_slots):
@@ -3271,6 +3376,8 @@ def run_batch() -> None:
             f"cdse_download_workers={CDSE_DOWNLOAD_WORKERS} "
             f"cdse_download_attempts={CDSE_DOWNLOAD_ATTEMPTS} "
             f"cdse_retry_base_s={CDSE_DOWNLOAD_RETRY_BASE_SECONDS} "
+            f"aerial_download_workers={max(1, int(job.aerial_workers))} "
+            f"aerial_chunk_workers={max(1, int(job.aerial_chunk_workers))} "
             f"aerial_download_attempts={AERIAL_DOWNLOAD_ATTEMPTS} "
             f"aerial_retry_base_s={AERIAL_DOWNLOAD_RETRY_BASE_SECONDS}"
         )
