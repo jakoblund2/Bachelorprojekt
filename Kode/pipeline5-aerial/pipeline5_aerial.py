@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter, sleep
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import rasterio
@@ -32,7 +32,7 @@ import requests
 from affine import Affine
 from dotenv import load_dotenv
 from pyproj import Transformer
-from rasterio.enums import Resampling
+from rasterio.enums import ColorInterp, Resampling
 from rasterio.errors import NotGeoreferencedWarning
 from rasterio.transform import from_origin
 from rasterio.warp import reproject, transform_bounds
@@ -88,6 +88,7 @@ S1_ACQ_KEY_RE = re.compile(
     r"^(S1[AB]_IW_GRDH_1SDV_\d{8}T\d{6}_\d{8}T\d{6}_[0-9A-Z]{6}_[0-9A-Z]{6})(?:_.+)?$"
 )
 S2_PASS_DT_RE = re.compile(r"^S2[AB]_MSIL2A_(\d{8}T\d{6})_")
+GEODKO_TILE_RE = re.compile(r"^\d{4}_1km_(\d+)_(\d+)$")
 YEAR_RE = re.compile(r"(19|20)\d{2}")
 
 
@@ -160,9 +161,9 @@ JOBS: List[Job] = [
     # ),
     Job(
         name="larger_test",
-        bbox_lonlat=(8.8, 55.7, 9.5, 56.2),  # small AOI
-        date_start="2025-06-12",
-        date_end="2025-06-12",
+        bbox_lonlat=(10.00, 56.09, 10.23, 56.18),  # small AOI
+        date_start="2025-04-01",
+        date_end="2025-04-01",
         max_s2=200,
         max_cloud=10.0,
         max_time_diff_hours=36,
@@ -172,7 +173,7 @@ JOBS: List[Job] = [
         min_valid_frac=0.9,
         output_mode="per_patch",
         aerial_target_res_m=1.0,
-        aerial_min_cov_frac=0.9,
+        aerial_min_cov_frac=1,
         aerial_download_batch_gb=4.0,
         aerial_workers=32,
         aerial_chunk_workers=24,
@@ -1267,6 +1268,48 @@ def _has_valid_georef(ds: rasterio.DatasetReader) -> bool:
     return True
 
 
+def _infer_geodko_bounds_from_name(file_name: str) -> Optional[Tuple[float, float, float, float]]:
+    stem = Path(file_name).stem
+    stem = stem.split("__", 1)[0]
+    m = GEODKO_TILE_RE.match(stem)
+    if not m:
+        return None
+    north_km = int(m.group(1))
+    east_km = int(m.group(2))
+    minx = float(east_km * 1000)
+    miny = float(north_km * 1000)
+    maxx = minx + 1000.0
+    maxy = miny + 1000.0
+    return minx, miny, maxx, maxy
+
+
+def _infer_geodko_georef(file_name: str, width: int, height: int) -> Optional[Tuple[Affine, str, Tuple[float, float, float, float]]]:
+    if width <= 0 or height <= 0:
+        return None
+    bounds = _infer_geodko_bounds_from_name(file_name)
+    if bounds is None:
+        return None
+    minx, miny, maxx, maxy = bounds
+    resx = (maxx - minx) / float(width)
+    resy = (maxy - miny) / float(height)
+    transform = from_origin(minx, maxy, resx, resy)
+    return transform, "EPSG:25832", bounds
+
+
+def _repair_cached_aerial_georef(cache_path: Path, source_name: str) -> bool:
+    try:
+        with rasterio.open(cache_path, "r+") as ds:
+            inferred = _infer_geodko_georef(source_name, ds.width, ds.height)
+            if inferred is None:
+                return False
+            transform, crs, _ = inferred
+            ds.transform = transform
+            ds.crs = crs
+    except Exception:
+        return False
+    return _is_valid_cached_aerial_tif(cache_path)
+
+
 def _is_valid_cached_aerial_tif(path: Path) -> bool:
     if not file_is_ready(path):
         return False
@@ -1281,6 +1324,15 @@ def _is_valid_cached_aerial_tif(path: Path) -> bool:
     except Exception:
         return False
     return True
+
+
+def _set_aerial_colorinterp(ds: rasterio.io.DatasetWriter) -> None:
+    ds.colorinterp = (
+        ColorInterp.red,
+        ColorInterp.green,
+        ColorInterp.blue,
+        ColorInterp.nir,
+    )
 
 
 def _reproject_strict(*args: Any, **kwargs: Any) -> Any:
@@ -1390,12 +1442,21 @@ def downsample_to_cache_1m(src_tif: Path, cache_path: Path, target_res_m: float)
     tmp.unlink(missing_ok=True)
 
     with rasterio.open(src_tif) as src:
+        inferred_src = None
         if not _has_valid_georef(src):
-            raise RuntimeError(f"Source TIFF has no valid georeference: {src_tif.name}")
+            inferred_src = _infer_geodko_georef(src_tif.name, src.width, src.height)
+            if inferred_src is None:
+                raise RuntimeError(f"Source TIFF has no valid georeference: {src_tif.name}")
         if src.count < 4:
             raise RuntimeError(f"Expected RGBNIR (>=4 bands), got {src.count} bands in {src_tif.name}")
 
-        left, bottom, right, top = src.bounds
+        if inferred_src is None:
+            src_transform = src.transform
+            src_crs = src.crs
+            left, bottom, right, top = src.bounds
+        else:
+            src_transform, src_crs, bounds = inferred_src
+            left, bottom, right, top = bounds
         width = max(1, int(math.ceil((right - left) / target_res_m)))
         height = max(1, int(math.ceil((top - bottom) / target_res_m)))
         transform = from_origin(left, top, target_res_m, target_res_m)
@@ -1416,16 +1477,17 @@ def downsample_to_cache_1m(src_tif: Path, cache_path: Path, target_res_m: float)
             blockysize=256,
         )
         with rasterio.open(tmp, "w", **profile) as dst:
+            _set_aerial_colorinterp(dst)
             src_nodata = src.nodata
             for out_band, src_band in enumerate([1, 2, 3, 4], start=1):
                 _reproject_strict(
                     source=rasterio.band(src, src_band),
                     destination=rasterio.band(dst, out_band),
-                    src_transform=src.transform,
-                    src_crs=src.crs,
+                    src_transform=src_transform,
+                    src_crs=src_crs,
                     src_nodata=src_nodata,
                     dst_transform=transform,
-                    dst_crs=src.crs,
+                    dst_crs=src_crs,
                     resampling=Resampling.bilinear,
                     init_dest_nodata=False,
                     num_threads=REPROJECT_THREADS,
@@ -1438,11 +1500,11 @@ def downsample_to_cache_1m(src_tif: Path, cache_path: Path, target_res_m: float)
             _reproject_strict(
                 source=src_mask,
                 destination=dst_mask,
-                src_transform=src.transform,
-                src_crs=src.crs,
+                src_transform=src_transform,
+                src_crs=src_crs,
                 src_nodata=0,
                 dst_transform=transform,
-                dst_crs=src.crs,
+                dst_crs=src_crs,
                 dst_nodata=0,
                 resampling=Resampling.nearest,
                 init_dest_nodata=True,
@@ -1485,6 +1547,18 @@ def parse_s2_pass_datetime(s2_pass_key: str) -> Optional[datetime]:
         return None
 
 
+def dedupe_catalog_records(records: Sequence[CatalogRecord]) -> List[CatalogRecord]:
+    out: List[CatalogRecord] = []
+    seen: Set[Tuple[str, str]] = set()
+    for rec in records:
+        key = (rec.dataset, rec.file_name)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(rec)
+    return out
+
+
 def create_aligned_aerial_grid_from_job(job: Job, target_crs: str) -> Dict[str, Any]:
     return aligned_aoi_grid(
         bbox_lonlat=job.bbox_lonlat,
@@ -1510,8 +1584,8 @@ def create_aerial_rasters(aerial_path: Path, cov_path: Path, grid: Dict[str, Any
     }
     aerial_path.parent.mkdir(parents=True, exist_ok=True)
     # Aerial mosaics can exceed 4 GiB after chunk merges; force BigTIFF.
-    with rasterio.open(aerial_path, "w", **with_bigtiff(profile, mode="YES")):
-        pass
+    with rasterio.open(aerial_path, "w", **with_bigtiff(profile, mode="YES")) as ds:
+        _set_aerial_colorinterp(ds)
 
     cov_profile = dict(profile)
     cov_profile.pop("predictor", None)
@@ -1522,17 +1596,26 @@ def create_aerial_rasters(aerial_path: Path, cov_path: Path, grid: Dict[str, Any
 
 def ingest_aerial_tif_to_grid(src_tif: Path, aerial_path: Path, cov_path: Path) -> None:
     with rasterio.open(src_tif) as src, rasterio.open(aerial_path, "r+") as dst, rasterio.open(cov_path, "r+") as cov:
+        inferred_src = None
         if not _has_valid_georef(src):
-            raise RuntimeError(f"Source TIFF has no valid georeference: {src_tif.name}")
+            inferred_src = _infer_geodko_georef(src_tif.name, src.width, src.height)
+            if inferred_src is None:
+                raise RuntimeError(f"Source TIFF has no valid georeference: {src_tif.name}")
         if src.count < 4:
             raise RuntimeError(f"Expected RGBNIR (>=4 bands), got {src.count} bands in {src_tif.name}")
+
+        if inferred_src is None:
+            src_transform = src.transform
+            src_crs = src.crs
+        else:
+            src_transform, src_crs, _ = inferred_src
 
         src_valid = (src.read_masks(1) > 0).astype(np.uint8)
         _reproject_strict(
             source=src_valid,
             destination=rasterio.band(cov, 1),
-            src_transform=src.transform,
-            src_crs=src.crs,
+            src_transform=src_transform,
+            src_crs=src_crs,
             src_nodata=0,
             dst_transform=dst.transform,
             dst_crs=dst.crs,
@@ -1547,8 +1630,8 @@ def ingest_aerial_tif_to_grid(src_tif: Path, aerial_path: Path, cov_path: Path) 
             _reproject_strict(
                 source=rasterio.band(src, src_band),
                 destination=rasterio.band(dst, out_band),
-                src_transform=src.transform,
-                src_crs=src.crs,
+                src_transform=src_transform,
+                src_crs=src_crs,
                 src_nodata=src_nodata,
                 dst_transform=dst.transform,
                 dst_crs=dst.crs,
@@ -1618,6 +1701,7 @@ def _prepare_aerial_cache_for_selected(
                 )
                 futures[fut] = (rec.dataset, rec.file_name)
 
+            done = 0
             for fut in as_completed(futures):
                 rec_dataset, file_name = futures[fut]
                 rec_key = (rec_dataset, file_name)
@@ -1647,6 +1731,12 @@ def _prepare_aerial_cache_for_selected(
                     log(
                         f"    Aerial single-file download failed for {rec_dataset}/{file_name} "
                         f"after {attempts_used} attempt(s): {err}"
+                    )
+                done += 1
+                if is_progress_tick(done, len(futures), 10):
+                    log(
+                        f"    Aerial download progress {i}/{len(chunks)}: "
+                        f"{done}/{len(futures)}"
                     )
 
         t_chunk = perf_counter() - t_chunk_start
@@ -1832,6 +1922,9 @@ def _build_chunk_mosaic_for_records(
 
     source_files_used: List[str] = []
     missing_sources = 0
+    ingest_fail_total = 0
+    ingest_fail_reasons: Dict[str, int] = {}
+    ingest_failed_files: List[Tuple[str, str, str]] = []
     chunk_cache_paths: List[Path] = []
     rec_paths: List[Tuple[str, str, List[Path]]] = []
     for rec in chunk_records:
@@ -1865,15 +1958,53 @@ def _build_chunk_mosaic_for_records(
     for rec_dataset, file_name, cache_paths in rec_paths:
         rec_ok = False
         for cache_path in cache_paths:
-            try:
-                ingest_aerial_tif_to_grid(cache_path, chunk_aerial, chunk_cov)
-                rec_ok = True
-            except Exception:
+            last_exc: Optional[Exception] = None
+            for attempt in range(1, 3):
+                try:
+                    ingest_aerial_tif_to_grid(cache_path, chunk_aerial, chunk_cov)
+                    rec_ok = True
+                    last_exc = None
+                    break
+                except Exception as exc:
+                    last_exc = exc
+                    if isinstance(exc, NotGeoreferencedWarning):
+                        if _repair_cached_aerial_georef(cache_path, file_name):
+                            log(
+                                "      repaired_georef: "
+                                f"dataset={rec_dataset} source={file_name} cache={cache_path.name}"
+                            )
+                            continue
+                    if attempt < 2:
+                        sleep(0.25)
+            if rec_ok:
+                continue
+
+            reason = type(last_exc).__name__ if last_exc is not None else "IngestError"
+            ingest_fail_total += 1
+            ingest_fail_reasons[reason] = ingest_fail_reasons.get(reason, 0) + 1
+            ingest_failed_files.append((rec_dataset, file_name, cache_path.name))
+
+            # Do not aggressively delete on transient ingest failures.
+            # Only drop cache files that fail basic integrity checks.
+            if not _is_valid_cached_aerial_tif(cache_path):
                 cache_path.unlink(missing_ok=True)
         if rec_ok:
             source_files_used.append(f"{rec_dataset}/{file_name}")
         else:
             missing_sources += 1
+
+    if ingest_fail_total > 0:
+        top = sorted(ingest_fail_reasons.items(), key=lambda kv: kv[1], reverse=True)[:3]
+        top_str = ", ".join(f"{k}:{v}" for k, v in top)
+        log(
+            f"    Aerial ingest failures in chunk {chunk_index}: "
+            f"{ingest_fail_total} ({top_str})"
+        )
+        for ds_name, src_name, cache_name in ingest_failed_files:
+            log(
+                "      failed_file: "
+                f"dataset={ds_name} source={src_name} cache={cache_name}"
+            )
 
     return {
         "chunk_index": int(chunk_index),
@@ -1881,6 +2012,8 @@ def _build_chunk_mosaic_for_records(
         "cov_path": chunk_cov,
         "source_files_used": sorted(set(source_files_used)),
         "missing_sources": int(missing_sources),
+        "ingest_fail_total": int(ingest_fail_total),
+        "ingest_fail_reasons": dict(ingest_fail_reasons),
         "row_off": int(chunk_grid["row_off"]),
         "col_off": int(chunk_grid["col_off"]),
         "width": int(chunk_grid["width"]),
@@ -2267,6 +2400,7 @@ def enrich_pass_patch_files_with_aerial(
         target_year=target_year,
         date_policy=AERIAL_DATE_POLICY,
     )
+    selected = dedupe_catalog_records(selected)
 
     if not selected or not dataset:
         log(f"  Aerial: no intersecting tiles for pass {s2_pass_key}; dropping {len(patch_paths)} patch files")

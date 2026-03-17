@@ -1,0 +1,15 @@
+numpy
+rasterio
+requests
+python-dotenv
+affine
+pyproj
+shapely
+matplotlib
+pandas
+pyarrow
+
+# Notes:
+# - SNAP / GPT is not a pip package. The original pipeline expects:
+#   ~/esa-snap/bin/gpt
+# - urllib3 comes in through requests and is used directly by the code.
